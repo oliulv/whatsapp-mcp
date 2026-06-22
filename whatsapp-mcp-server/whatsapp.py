@@ -1,13 +1,13 @@
 import sqlite3
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List
 import os.path
 import requests
 import json
-import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -204,16 +204,16 @@ def list_messages(
         if include_context and result:
             # Add context for each message
             messages_with_context = []
+            seen_ids = set()
             for msg in result:
                 context = get_message_context(msg.id, context_before, context_after)
-                messages_with_context.extend(context.before)
-                messages_with_context.append(context.message)
-                messages_with_context.extend(context.after)
-            
-            return format_messages_list(messages_with_context, show_chat_info=True)
-            
-        # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
+                for m in (*context.before, context.message, *context.after):
+                    if m.id not in seen_ids:
+                        seen_ids.add(m.id)
+                        messages_with_context.append(m)
+            return messages_with_context
+
+        return result
         
     except sqlite3.Error as e:
         print(f"Database error: {e}")
@@ -391,39 +391,166 @@ def list_chats(
 
 
 def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+    """Search contacts by name or phone number.
+
+    Searches both the messages.db chats table (chats you've actually exchanged
+    messages in) and the whatsmeow_contacts phonebook (every WhatsApp contact
+    your phone knows). For people whose primary identifier is a LID (modern
+    WhatsApp), resolves to the LID-keyed chat JID so list_messages works.
+    """
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn.execute(f"ATTACH DATABASE '{WHATSMEOW_DB_PATH}' AS wa")
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+
+        pattern = f"%{query}%"
+
+        # 1) Phonebook contacts (whatsmeow_contacts), with LID resolution and
+        #    a join to the chats table to know which JID actually has messages.
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
+            SELECT
+                c.their_jid,
+                COALESCE(NULLIF(c.full_name, ''),
+                         NULLIF(c.first_name, ''),
+                         NULLIF(c.push_name, ''),
+                         NULLIF(c.business_name, '')) AS name,
+                m.lid AS lid
+            FROM wa.whatsmeow_contacts c
+            LEFT JOIN wa.whatsmeow_lid_map m
+                ON m.pn = REPLACE(c.their_jid, '@s.whatsapp.net', '')
+            WHERE
+                LOWER(c.full_name)     LIKE LOWER(?)
+                OR LOWER(c.first_name)    LIKE LOWER(?)
+                OR LOWER(c.push_name)     LIKE LOWER(?)
+                OR LOWER(c.business_name) LIKE LOWER(?)
+                OR c.their_jid            LIKE ?
+            LIMIT 100
+        """, (pattern, pattern, pattern, pattern, pattern))
+        phonebook_rows = cursor.fetchall()
+
+        # 2) Existing-style match against messages.db chats (catches non-DM
+        #    cases and people not in the phonebook but with named chats).
+        cursor.execute("""
+            SELECT DISTINCT jid, name
             FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+            WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
                 AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
-            LIMIT 50
-        """, (search_pattern, search_pattern))
-        
-        contacts = cursor.fetchall()
-        
-        result = []
-        for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
+            LIMIT 100
+        """, (pattern, pattern))
+        chat_rows = cursor.fetchall()
+
+        seen_phones = set()
+        result: List[Contact] = []
+
+        for their_jid, name, lid in phonebook_rows:
+            if not their_jid or '@' not in their_jid:
+                continue
+            phone = their_jid.split('@')[0]
+            if phone in seen_phones:
+                continue
+            # Prefer the LID-keyed chat if one exists in messages.db
+            chat_jid = their_jid
+            if lid:
+                cursor.execute("SELECT 1 FROM chats WHERE jid = ? LIMIT 1", (f"{lid}@lid",))
+                if cursor.fetchone():
+                    chat_jid = f"{lid}@lid"
+            seen_phones.add(phone)
+            result.append(Contact(phone_number=phone, name=name, jid=chat_jid))
+
+        for jid, name in chat_rows:
+            if not jid or '@' not in jid:
+                continue
+            # Resolve LID-keyed chats back to phone for the Contact.phone_number
+            if jid.endswith('@lid'):
+                lid_part = jid.split('@')[0]
+                cursor.execute("SELECT pn FROM wa.whatsmeow_lid_map WHERE lid = ?", (lid_part,))
+                row = cursor.fetchone()
+                phone = row[0] if row else lid_part
+            else:
+                phone = jid.split('@')[0]
+            if phone in seen_phones:
+                continue
+            seen_phones.add(phone)
+            result.append(Contact(phone_number=phone, name=name, jid=jid))
+
+        result.sort(key=lambda c: ((c.name or '').lower(), c.phone_number))
+        return result[:50]
+
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def list_contacts(
+    query: Optional[str] = None,
+    limit: int = 200,
+    page: int = 0
+) -> List[Contact]:
+    """List WhatsApp contacts from the phonebook and direct chats.
+
+    This is read-only and intended for deterministic offline matching. It uses
+    the same LID resolution strategy as search_contacts, but supports
+    pagination and an optional broad query.
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn.execute(f"ATTACH DATABASE '{WHATSMEOW_DB_PATH}' AS wa")
+        cursor = conn.cursor()
+
+        where = ""
+        params: List[str | int] = []
+        if query:
+            pattern = f"%{query}%"
+            where = """
+                WHERE
+                    LOWER(c.full_name)     LIKE LOWER(?)
+                    OR LOWER(c.first_name)    LIKE LOWER(?)
+                    OR LOWER(c.push_name)     LIKE LOWER(?)
+                    OR LOWER(c.business_name) LIKE LOWER(?)
+                    OR c.their_jid            LIKE ?
+            """
+            params.extend([pattern, pattern, pattern, pattern, pattern])
+
+        offset = page * limit
+        cursor.execute(f"""
+            SELECT
+                c.their_jid,
+                COALESCE(NULLIF(c.full_name, ''),
+                         NULLIF(c.first_name, ''),
+                         NULLIF(c.push_name, ''),
+                         NULLIF(c.business_name, '')) AS name,
+                m.lid AS lid
+            FROM wa.whatsmeow_contacts c
+            LEFT JOIN wa.whatsmeow_lid_map m
+                ON m.pn = REPLACE(c.their_jid, '@s.whatsapp.net', '')
+            {where}
+            ORDER BY LOWER(name), c.their_jid
+            LIMIT ? OFFSET ?
+        """, tuple(params + [limit, offset]))
+        rows = cursor.fetchall()
+
+        result: List[Contact] = []
+        seen = set()
+        for their_jid, name, lid in rows:
+            if not their_jid or '@' not in their_jid:
+                continue
+            phone = their_jid.split('@')[0]
+            chat_jid = their_jid
+            if lid:
+                cursor.execute("SELECT 1 FROM chats WHERE jid = ? LIMIT 1", (f"{lid}@lid",))
+                if cursor.fetchone():
+                    chat_jid = f"{lid}@lid"
+            key = (phone, chat_jid)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(Contact(phone_number=phone, name=name, jid=chat_jid))
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -621,108 +748,6 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     finally:
         if 'conn' in locals():
             conn.close()
-
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
-    try:
-        # Validate input
-        if not recipient:
-            return False, "Recipient must be provided"
-        
-        url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {
-            "recipient": recipient,
-            "message": message,
-        }
-        
-        response = requests.post(url, json=payload)
-        
-        # Check if the request was successful
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
-    except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
-    except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
-    except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
-
-def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
-    try:
-        # Validate input
-        if not recipient:
-            return False, "Recipient must be provided"
-        
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
-        
-        url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {
-            "recipient": recipient,
-            "media_path": media_path
-        }
-        
-        response = requests.post(url, json=payload)
-        
-        # Check if the request was successful
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
-    except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
-    except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
-    except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
-
-def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
-    try:
-        # Validate input
-        if not recipient:
-            return False, "Recipient must be provided"
-        
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
-
-        if not media_path.endswith(".ogg"):
-            try:
-                media_path = audio.convert_to_opus_ogg_temp(media_path)
-            except Exception as e:
-                return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
-        
-        url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {
-            "recipient": recipient,
-            "media_path": media_path
-        }
-        
-        response = requests.post(url, json=payload)
-        
-        # Check if the request was successful
-        if response.status_code == 200:
-            result = response.json()
-            return result.get("success", False), result.get("message", "Unknown response")
-        else:
-            return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
-    except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
-    except json.JSONDecodeError:
-        return False, f"Error parsing response: {response.text}"
-    except Exception as e:
-        return False, f"Unexpected error: {str(e)}"
 
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.

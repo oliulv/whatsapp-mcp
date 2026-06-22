@@ -1,7 +1,15 @@
+import os
+from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.transport_security import TransportSecuritySettings
+except ModuleNotFoundError:
+    TransportSecuritySettings = None
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
+    list_contacts as whatsapp_list_contacts,
     list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
     get_chat as whatsapp_get_chat,
@@ -9,14 +17,36 @@ from whatsapp import (
     get_contact_chats as whatsapp_get_contact_chats,
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
-    send_message as whatsapp_send_message,
-    send_file as whatsapp_send_file,
-    send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
 
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+transport_security_settings = {}
+if TransportSecuritySettings is not None:
+    transport_security_settings["transport_security"] = TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    )
+
+mcp = FastMCP("whatsapp",
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("MCP_PORT", "8081")),
+    **transport_security_settings)
+
+
+def _serialize(obj: Any) -> Any:
+    """Recursively convert dataclasses to dicts and datetimes to ISO strings
+    so FastMCP's Pydantic output validation and JSON encoding both succeed."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return _serialize(asdict(obj))
+    if isinstance(obj, list):
+        return [_serialize(x) for x in obj]
+    if isinstance(obj, tuple):
+        return [_serialize(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _serialize(v) for k, v in obj.items()}
+    return obj
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -26,7 +56,22 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
         query: Search term to match against contact names or phone numbers
     """
     contacts = whatsapp_search_contacts(query)
-    return contacts
+    return _serialize(contacts)
+
+@mcp.tool()
+def list_contacts(query: Optional[str] = None, limit: int = 200, page: int = 0) -> List[Dict[str, Any]]:
+    """List WhatsApp contacts from the local phonebook and direct chats.
+
+    This is read-only. It exists so enrichment jobs can build deterministic
+    Attio mappings without calling send/write tools.
+
+    Args:
+        query: Optional search term to filter contacts by name or phone number
+        limit: Maximum number of contacts to return (default 200)
+        page: Page number for pagination (default 0)
+    """
+    contacts = whatsapp_list_contacts(query=query, limit=limit, page=page)
+    return _serialize(contacts)
 
 @mcp.tool()
 def list_messages(
@@ -67,7 +112,7 @@ def list_messages(
         context_before=context_before,
         context_after=context_after
     )
-    return messages
+    return _serialize(messages)
 
 @mcp.tool()
 def list_chats(
@@ -93,7 +138,7 @@ def list_chats(
         include_last_message=include_last_message,
         sort_by=sort_by
     )
-    return chats
+    return _serialize(chats)
 
 @mcp.tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
@@ -104,7 +149,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
         include_last_message: Whether to include the last message (default True)
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat
+    return _serialize(chat)
 
 @mcp.tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
@@ -114,7 +159,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
         sender_phone_number: The phone number to search for
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat
+    return _serialize(chat)
 
 @mcp.tool()
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
@@ -126,7 +171,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
         page: Page number for pagination (default 0)
     """
     chats = whatsapp_get_contact_chats(jid, limit, page)
-    return chats
+    return _serialize(chats)
 
 @mcp.tool()
 def get_last_interaction(jid: str) -> str:
@@ -152,74 +197,7 @@ def get_message_context(
         after: Number of messages to include after the target message (default 5)
     """
     context = whatsapp_get_message_context(message_id, before, after)
-    return context
-
-@mcp.tool()
-def send_message(
-    recipient: str,
-    message: str
-) -> Dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
-
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        message: The message text to send
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    # Validate input
-    if not recipient:
-        return {
-            "success": False,
-            "message": "Recipient must be provided"
-        }
-    
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
-    return {
-        "success": success,
-        "message": status_message
-    }
-
-@mcp.tool()
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
-
-@mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
+    return _serialize(context)
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
@@ -247,5 +225,5 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
         }
 
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    mcp.run(transport=transport)
