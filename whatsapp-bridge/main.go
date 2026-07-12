@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -428,6 +429,12 @@ func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, str
 	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
 }
 
+func mediaLocalPath(chatDir, filename, messageID string) string {
+	digest := sha256.Sum256([]byte(messageID))
+	extension := filepath.Ext(filepath.Base(filename))
+	return filepath.Join(chatDir, fmt.Sprintf("%x%s", digest[:12], extension))
+}
+
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
 type MediaDownloader struct {
 	URL           string
@@ -511,8 +518,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// Bind the local cache path to the WhatsApp message ID. Media filenames are
+	// generated with second-level timestamps and are not unique, so using the
+	// filename alone can return another message's already-downloaded audio.
+	localPath = mediaLocalPath(chatDir, filename, messageID)
 
 	// Get absolute path
 	absPath, err := filepath.Abs(localPath)

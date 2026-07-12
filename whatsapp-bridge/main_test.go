@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
@@ -15,6 +16,21 @@ import (
 
 	"go.mau.fi/whatsmeow/types/events"
 )
+
+func TestMediaLocalPathIsBoundToMessageID(t *testing.T) {
+	chatDir := filepath.Join("store", "example-chat")
+	first := mediaLocalPath(chatDir, "same-second.ogg", "message-A")
+	second := mediaLocalPath(chatDir, "same-second.ogg", "message-B")
+	if first == second {
+		t.Fatalf("different message IDs must not reuse the same media path: %q", first)
+	}
+	if filepath.Dir(first) != chatDir {
+		t.Fatalf("media path escaped chat directory: %q", first)
+	}
+	if filepath.Ext(first) != ".ogg" {
+		t.Fatalf("expected original media extension, got %q", first)
+	}
+}
 
 type fakeConnectionState struct {
 	connected bool
