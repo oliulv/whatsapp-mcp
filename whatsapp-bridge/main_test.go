@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"net"
@@ -29,6 +30,22 @@ func TestMediaLocalPathIsBoundToMessageID(t *testing.T) {
 	}
 	if filepath.Ext(first) != ".ogg" {
 		t.Fatalf("expected original media extension, got %q", first)
+	}
+}
+
+func TestMediaFileMatchesStoredPlaintextHash(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "voice-note.ogg")
+	data := []byte("decrypted voice-note bytes")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	expected := sha256.Sum256(data)
+	if !mediaFileMatchesSHA256(path, expected[:]) {
+		t.Fatal("expected matching plaintext hash")
+	}
+	wrong := sha256.Sum256([]byte("different media"))
+	if mediaFileMatchesSHA256(path, wrong[:]) {
+		t.Fatal("must reject a cached file with the wrong plaintext hash")
 	}
 }
 

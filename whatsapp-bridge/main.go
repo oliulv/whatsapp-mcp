@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -435,6 +436,43 @@ func mediaLocalPath(chatDir, filename, messageID string) string {
 	return filepath.Join(chatDir, fmt.Sprintf("%x%s", digest[:12], extension))
 }
 
+func mediaFileMatchesSHA256(path string, expected []byte) bool {
+	if len(expected) == 0 {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	actual := sha256.Sum256(data)
+	return bytes.Equal(actual[:], expected)
+}
+
+func writeMediaFileAtomically(path string, data []byte) error {
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".whatsapp-media-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
+}
+
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
 type MediaDownloader struct {
 	URL           string
@@ -530,7 +568,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Check if file already exists
-	if _, err := os.Stat(localPath); err == nil {
+	if mediaFileMatchesSHA256(localPath, fileSHA256) {
 		// File exists, return it
 		return true, mediaType, filename, absPath, nil
 	}
@@ -575,9 +613,14 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
+	actualSHA256 := sha256.Sum256(mediaData)
+	if !bytes.Equal(actualSHA256[:], fileSHA256) {
+		return false, "", "", "", fmt.Errorf("downloaded media plaintext checksum mismatch")
+	}
 
-	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	// Save the downloaded media atomically so a bridge restart cannot leave a
+	// partial file that later appears to be a valid cache hit.
+	if err := writeMediaFileAtomically(localPath, mediaData); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
