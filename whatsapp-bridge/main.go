@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -437,18 +438,37 @@ func mediaLocalPath(chatDir, filename, messageID string) string {
 }
 
 func mediaFileMatchesSHA256(path string, expected []byte) bool {
+	return mediaFileMatchesSHA256AndLength(path, expected, 0)
+}
+
+func mediaFileMatchesSHA256AndLength(path string, expected []byte, expectedLength uint64) bool {
 	if len(expected) == 0 {
 		return false
 	}
-	data, err := os.ReadFile(path)
+	pathInfo, err := os.Lstat(path)
+	if err != nil || !pathInfo.Mode().IsRegular() {
+		return false
+	}
+	file, err := os.Open(path)
 	if err != nil {
 		return false
 	}
-	actual := sha256.Sum256(data)
-	return bytes.Equal(actual[:], expected)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
+		return false
+	}
+	if expectedLength > 0 && (info.Size() < 0 || uint64(info.Size()) != expectedLength) {
+		return false
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return false
+	}
+	return bytes.Equal(hasher.Sum(nil), expected)
 }
 
-func writeMediaFileAtomically(path string, data []byte) error {
+func writeMediaReaderAtomically(path string, source io.Reader, expected []byte, expectedLength uint64) error {
 	temporary, err := os.CreateTemp(filepath.Dir(path), ".whatsapp-media-*")
 	if err != nil {
 		return err
@@ -459,9 +479,19 @@ func writeMediaFileAtomically(path string, data []byte) error {
 		temporary.Close()
 		return err
 	}
-	if _, err := temporary.Write(data); err != nil {
+	hasher := sha256.New()
+	written, err := io.Copy(io.MultiWriter(temporary, hasher), source)
+	if err != nil {
 		temporary.Close()
 		return err
+	}
+	if expectedLength > 0 && (written < 0 || uint64(written) != expectedLength) {
+		temporary.Close()
+		return fmt.Errorf("media plaintext length mismatch")
+	}
+	if len(expected) > 0 && !bytes.Equal(hasher.Sum(nil), expected) {
+		temporary.Close()
+		return fmt.Errorf("media plaintext checksum mismatch")
 	}
 	if err := temporary.Sync(); err != nil {
 		temporary.Close()
@@ -470,7 +500,69 @@ func writeMediaFileAtomically(path string, data []byte) error {
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	return os.Rename(temporaryPath, path)
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
+}
+
+func writeMediaFileAtomically(path string, data []byte) error {
+	return writeMediaReaderAtomically(path, bytes.NewReader(data), nil, uint64(len(data)))
+}
+
+func validatedPrivateMediaFile(path string, expected []byte, expectedLength uint64) (bool, error) {
+	if !mediaFileMatchesSHA256AndLength(path, expected, expectedLength) {
+		return false, nil
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func legacyMediaLocalPath(chatDir, filename string) string {
+	base := filepath.Base(filename)
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return ""
+	}
+	return filepath.Join(chatDir, base)
+}
+
+func migrateLegacyMediaFile(legacyPath, localPath string, expected []byte, expectedLength uint64) (bool, error) {
+	if legacyPath == "" || filepath.Clean(legacyPath) == filepath.Clean(localPath) {
+		return false, nil
+	}
+	// The legacy filename cache can contain bytes for another message because
+	// WhatsApp-generated filenames are not unique. Never copy it unless its
+	// decrypted plaintext matches this message's database checksum and length.
+	if !mediaFileMatchesSHA256AndLength(legacyPath, expected, expectedLength) {
+		return false, nil
+	}
+	legacy, err := os.Open(legacyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer legacy.Close()
+	if err := writeMediaReaderAtomically(localPath, legacy, expected, expectedLength); err != nil {
+		return false, err
+	}
+	// Verify the final pathname before removing the only legacy copy. This also
+	// protects against an unexpected rename/race leaving different bytes behind.
+	valid, err := validatedPrivateMediaFile(localPath, expected, expectedLength)
+	if err != nil {
+		return false, err
+	}
+	if !valid {
+		_ = os.Remove(localPath)
+		return false, fmt.Errorf("migrated media failed final checksum verification")
+	}
+	if err := os.Remove(legacyPath); err != nil && !os.IsNotExist(err) {
+		return true, err
+	}
+	return true, nil
 }
 
 // MediaDownloader implements the whatsmeow.DownloadableMessage interface
@@ -567,10 +659,29 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
 	}
 
-	// Check if file already exists
-	if mediaFileMatchesSHA256(localPath, fileSHA256) {
-		// File exists, return it
+	// Check the message-ID-bound cache first and repair its permissions before
+	// returning a path to another process.
+	validLocal, err := validatedPrivateMediaFile(localPath, fileSHA256, fileLength)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to secure cached media file: %v", err)
+	}
+	if validLocal {
 		return true, mediaType, filename, absPath, nil
+	}
+
+	// Older bridge builds cached decrypted media at chatDir/filename. Recover a
+	// legacy file only when it matches this DB row; filename collisions must
+	// never populate or be served from another message's hashed cache path.
+	legacyPath := legacyMediaLocalPath(chatDir, filename)
+	migrated, migrationErr := migrateLegacyMediaFile(legacyPath, localPath, fileSHA256, fileLength)
+	if migrated {
+		if migrationErr != nil {
+			fmt.Printf("Warning: migrated legacy media for message %s but could not remove the legacy file: %v\n", messageID, migrationErr)
+		}
+		return true, mediaType, filename, absPath, nil
+	}
+	if migrationErr != nil {
+		return false, "", "", "", fmt.Errorf("failed to migrate legacy media cache: %v", migrationErr)
 	}
 
 	// If we don't have all the media info we need, we can't download

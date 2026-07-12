@@ -49,6 +49,251 @@ func TestMediaFileMatchesStoredPlaintextHash(t *testing.T) {
 	}
 }
 
+func TestMediaFileChecksumStreamsLargeFileAndChecksLength(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large-media.bin")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasher := sha256.New()
+	block := make([]byte, 64*1024)
+	for index := range block {
+		block[index] = byte(index % 251)
+	}
+	const blockCount = 256 // 16 MiB without a whole-file test allocation.
+	for range blockCount {
+		if _, err := file.Write(block); err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+		if _, err := hasher.Write(block); err != nil {
+			file.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	expectedLength := uint64(len(block) * blockCount)
+	if !mediaFileMatchesSHA256AndLength(path, hasher.Sum(nil), expectedLength) {
+		t.Fatal("expected streaming checksum and stat length to match large media")
+	}
+	if mediaFileMatchesSHA256AndLength(path, hasher.Sum(nil), expectedLength+1) {
+		t.Fatal("expected stat length mismatch to reject media before serving")
+	}
+}
+
+func TestMatchingLegacyMediaMigratesAtomicallyAndPrivately(t *testing.T) {
+	chatDir := t.TempDir()
+	filename := "legacy-voice-note.ogg"
+	legacyPath := legacyMediaLocalPath(chatDir, filename)
+	localPath := mediaLocalPath(chatDir, filename, "message-A")
+	data := []byte("decrypted legacy voice-note bytes")
+	expected := sha256.Sum256(data)
+	if err := os.WriteFile(legacyPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := migrateLegacyMediaFile(legacyPath, localPath, expected[:], uint64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrated {
+		t.Fatal("expected matching legacy media to migrate")
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy file must be removed only after verified migration, stat err=%v", err)
+	}
+	if !mediaFileMatchesSHA256AndLength(localPath, expected[:], uint64(len(data))) {
+		t.Fatal("migrated message-ID cache did not retain the verified bytes")
+	}
+	info, err := os.Stat(localPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("migrated cache must be private, got mode %04o", info.Mode().Perm())
+	}
+}
+
+func TestMismatchedLegacyMediaIsRejectedWithoutPoisoningNewCache(t *testing.T) {
+	chatDir := t.TempDir()
+	filename := "colliding-voice-note.ogg"
+	legacyPath := legacyMediaLocalPath(chatDir, filename)
+	localPath := mediaLocalPath(chatDir, filename, "message-A")
+	legacyData := []byte("bytes belonging to another message")
+	expected := sha256.Sum256([]byte("expected message A bytes"))
+	if err := os.WriteFile(legacyPath, legacyData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := migrateLegacyMediaFile(legacyPath, localPath, expected[:], uint64(len(legacyData)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migrated {
+		t.Fatal("must not migrate legacy bytes with another message's checksum")
+	}
+	if _, err := os.Stat(localPath); !os.IsNotExist(err) {
+		t.Fatalf("mismatch must not populate the message-ID cache, stat err=%v", err)
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("mismatched legacy evidence must remain untouched, got %v", err)
+	}
+}
+
+func TestValidNewMediaCacheIsRepairedToPrivateMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "message-bound.ogg")
+	data := []byte("valid decrypted media")
+	expected := sha256.Sum256(data)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	valid, err := validatedPrivateMediaFile(path, expected[:], uint64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !valid {
+		t.Fatal("expected valid message-ID cache hit")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("valid cache hit must be chmod 0600, got %04o", info.Mode().Perm())
+	}
+}
+
+func TestLegacyFilenameCollisionOnlyMigratesMatchingMessage(t *testing.T) {
+	chatDir := t.TempDir()
+	filename := "same-second.ogg"
+	legacyPath := legacyMediaLocalPath(chatDir, filename)
+	messageAPath := mediaLocalPath(chatDir, filename, "message-A")
+	messageBPath := mediaLocalPath(chatDir, filename, "message-B")
+	messageAData := []byte("message A voice note")
+	messageBData := []byte("message B voice note")
+	messageAHash := sha256.Sum256(messageAData)
+	messageBHash := sha256.Sum256(messageBData)
+	if err := os.WriteFile(legacyPath, messageBData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	migratedA, err := migrateLegacyMediaFile(
+		legacyPath,
+		messageAPath,
+		messageAHash[:],
+		uint64(len(messageAData)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if migratedA {
+		t.Fatal("collision must not migrate message B bytes into message A's cache")
+	}
+	if _, err := os.Stat(messageAPath); !os.IsNotExist(err) {
+		t.Fatalf("message A cache was poisoned, stat err=%v", err)
+	}
+
+	migratedB, err := migrateLegacyMediaFile(
+		legacyPath,
+		messageBPath,
+		messageBHash[:],
+		uint64(len(messageBData)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migratedB {
+		t.Fatal("matching message B should recover the colliding legacy filename")
+	}
+	if !mediaFileMatchesSHA256AndLength(messageBPath, messageBHash[:], uint64(len(messageBData))) {
+		t.Fatal("message B cache did not contain its verified media")
+	}
+	if messageAPath == messageBPath {
+		t.Fatal("message-ID cache paths must remain collision-safe")
+	}
+}
+
+func TestDownloadMediaUsesVerifiedLegacyCacheBeforeNetwork(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	db, err := sql.Open("sqlite3", filepath.Join(root, "messages.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`
+		CREATE TABLE messages (
+			id TEXT,
+			chat_jid TEXT,
+			media_type TEXT,
+			filename TEXT,
+			url TEXT,
+			media_key BLOB,
+			file_sha256 BLOB,
+			file_enc_sha256 BLOB,
+			file_length INTEGER
+		)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	messageID := "legacy-message"
+	chatJID := "chat@lid"
+	filename := "legacy.ogg"
+	data := []byte("verified legacy voice note")
+	expected := sha256.Sum256(data)
+	if _, err := db.Exec(
+		"INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		messageID,
+		chatJID,
+		"audio",
+		filename,
+		"",
+		[]byte(nil),
+		expected[:],
+		[]byte(nil),
+		len(data),
+	); err != nil {
+		t.Fatal(err)
+	}
+	chatDir := filepath.Join("store", chatJID)
+	if err := os.MkdirAll(chatDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	legacyPath := legacyMediaLocalPath(chatDir, filename)
+	if err := os.WriteFile(legacyPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	success, mediaType, returnedFilename, returnedPath, err := downloadMedia(
+		nil,
+		&MessageStore{db: db},
+		messageID,
+		chatJID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !success || mediaType != "audio" || returnedFilename != filename {
+		t.Fatalf("unexpected migrated download result: success=%v type=%q filename=%q", success, mediaType, returnedFilename)
+	}
+	expectedPath, err := filepath.Abs(mediaLocalPath(chatDir, filename, messageID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returnedPath != expectedPath {
+		t.Fatalf("download must return message-ID cache path %q, got %q", expectedPath, returnedPath)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy file should be removed after /download migration, stat err=%v", err)
+	}
+}
+
 type fakeConnectionState struct {
 	connected bool
 	loggedIn  bool
