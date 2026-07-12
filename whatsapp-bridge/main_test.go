@@ -5,18 +5,25 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestMediaLocalPathIsBoundToMessageID(t *testing.T) {
@@ -57,6 +64,270 @@ func TestExpiredMediaErrorsUseDirectPathFallback(t *testing.T) {
 	}
 	if retryableExpiredMediaError(context.Canceled) {
 		t.Fatal("context cancellation must not trigger a second media request")
+	}
+}
+
+func TestMediaRetryRegistersBeforeFastResponse(t *testing.T) {
+	coordinator := newMediaRetryCoordinator(1)
+	coordinator.decrypt = func(*events.MediaRetry, []byte) (*waMmsRetry.MediaRetryNotification, error) {
+		return &waMmsRetry.MediaRetryNotification{
+			StanzaID:   proto.String("message-1"),
+			DirectPath: proto.String("/fresh/path?token=value"),
+			Result:     waMmsRetry.MediaRetryNotification_SUCCESS.Enum(),
+		}, nil
+	}
+	chat := types.NewJID("12345", types.DefaultUserServer)
+	info := &types.MessageInfo{
+		ID: types.MessageID("message-1"),
+		MessageSource: types.MessageSource{
+			Chat: chat,
+		},
+	}
+	path, err := coordinator.request(
+		context.Background(),
+		info,
+		[]byte("media-key"),
+		func(context.Context, *types.MessageInfo, []byte) error {
+			coordinator.handle(&events.MediaRetry{
+				MessageID: info.ID,
+				ChatID:    info.Chat,
+			})
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/fresh/path?token=value" {
+		t.Fatalf("unexpected refreshed direct path %q", path)
+	}
+}
+
+func TestConcurrentMediaRetriesShareOneReceipt(t *testing.T) {
+	coordinator := newMediaRetryCoordinator(1)
+	coordinator.decrypt = func(*events.MediaRetry, []byte) (*waMmsRetry.MediaRetryNotification, error) {
+		return &waMmsRetry.MediaRetryNotification{
+			StanzaID:   proto.String("message-1"),
+			DirectPath: proto.String("/fresh/path?token=value"),
+			Result:     waMmsRetry.MediaRetryNotification_SUCCESS.Enum(),
+		}, nil
+	}
+	info := &types.MessageInfo{
+		ID: types.MessageID("message-1"),
+		MessageSource: types.MessageSource{
+			Chat: types.NewJID("12345", types.DefaultUserServer),
+		},
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var sends atomic.Int32
+	send := func(context.Context, *types.MessageInfo, []byte) error {
+		if sends.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		coordinator.handle(&events.MediaRetry{MessageID: info.ID, ChatID: info.Chat})
+		return nil
+	}
+
+	var wait sync.WaitGroup
+	wait.Add(2)
+	errors := make(chan error, 2)
+	for range 2 {
+		go func() {
+			defer wait.Done()
+			path, err := coordinator.request(context.Background(), info, []byte("media-key"), send)
+			if err == nil && path != "/fresh/path?token=value" {
+				err = fmt.Errorf("unexpected refreshed direct path %q", path)
+			}
+			errors <- err
+		}()
+	}
+	<-started
+	close(release)
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if sends.Load() != 1 {
+		t.Fatalf("expected one media retry receipt, got %d", sends.Load())
+	}
+}
+
+func TestCanceledWaiterDoesNotPoisonSharedMediaRetry(t *testing.T) {
+	coordinator := newMediaRetryCoordinator(1)
+	coordinator.decrypt = func(*events.MediaRetry, []byte) (*waMmsRetry.MediaRetryNotification, error) {
+		return &waMmsRetry.MediaRetryNotification{
+			StanzaID:   proto.String("message-1"),
+			DirectPath: proto.String("/fresh/path?token=value"),
+			Result:     waMmsRetry.MediaRetryNotification_SUCCESS.Enum(),
+		}, nil
+	}
+	info := &types.MessageInfo{
+		ID: types.MessageID("message-1"),
+		MessageSource: types.MessageSource{
+			Chat: types.NewJID("12345", types.DefaultUserServer),
+		},
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var sends atomic.Int32
+	send := func(context.Context, *types.MessageInfo, []byte) error {
+		if sends.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		coordinator.handle(&events.MediaRetry{MessageID: info.ID, ChatID: info.Chat})
+		return nil
+	}
+
+	firstContext, cancelFirst := context.WithCancel(context.Background())
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := coordinator.request(firstContext, info, []byte("media-key"), send)
+		firstResult <- err
+	}()
+	<-started
+	cancelFirst()
+	if err := <-firstResult; err == nil || !strings.Contains(err.Error(), "wait canceled") {
+		t.Fatalf("expected the first waiter to cancel independently, got %v", err)
+	}
+
+	secondResult := make(chan mediaRetryResult, 1)
+	go func() {
+		path, err := coordinator.request(context.Background(), info, []byte("media-key"), send)
+		secondResult <- mediaRetryResult{directPath: path, err: err}
+	}()
+	close(release)
+	result := <-secondResult
+	if result.err != nil || result.directPath != "/fresh/path?token=value" {
+		t.Fatalf("live waiter did not receive the shared result: path=%q err=%v", result.directPath, result.err)
+	}
+	if sends.Load() != 1 {
+		t.Fatalf("expected one media retry receipt, got %d", sends.Load())
+	}
+}
+
+func TestMediaRetryRejectsWrongResponseIdentity(t *testing.T) {
+	coordinator := newMediaRetryCoordinator(1)
+	info := &types.MessageInfo{
+		ID: types.MessageID("message-1"),
+		MessageSource: types.MessageSource{
+			Chat: types.NewJID("12345", types.DefaultUserServer),
+		},
+	}
+	_, err := coordinator.request(
+		context.Background(),
+		info,
+		[]byte("media-key"),
+		func(context.Context, *types.MessageInfo, []byte) error {
+			coordinator.handle(&events.MediaRetry{
+				MessageID: info.ID,
+				ChatID:    info.Chat,
+				FromMe:    true,
+			})
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("expected response identity mismatch, got %v", err)
+	}
+}
+
+func TestGroupMediaRetryUsesExactSessionSender(t *testing.T) {
+	messageDB, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer messageDB.Close()
+	if _, err := messageDB.Exec(`
+		CREATE TABLE messages (
+			id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			sender_jid TEXT,
+			is_from_me BOOLEAN
+		);
+		INSERT INTO messages VALUES ('message-1', 'group-1@g.us', '777', '', 0);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	sessionDB, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "session.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessionDB.Close()
+	if _, err := sessionDB.Exec(`
+		CREATE TABLE whatsmeow_message_secrets (
+			our_jid TEXT,
+			chat_jid TEXT,
+			sender_jid TEXT,
+			message_id TEXT
+		);
+		INSERT INTO whatsmeow_message_secrets VALUES
+			('111@s.whatsapp.net', 'group-1@g.us', '777@lid', 'message-1'),
+			('222@s.whatsapp.net', 'group-1@g.us', '999@lid', 'message-1');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	messageStore := &MessageStore{db: messageDB, sessionDB: sessionDB}
+	ownJID := types.NewJID("111", types.DefaultUserServer)
+	client := &whatsmeow.Client{Store: &store.Device{ID: &ownJID}}
+	info, err := mediaRetryMessageInfo(context.Background(), client, messageStore, "message-1", "group-1@g.us")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsGroup || info.Sender.String() != "777@lid" {
+		t.Fatalf("expected exact session sender, got group=%v sender=%q", info.IsGroup, info.Sender)
+	}
+}
+
+func TestLegacyOutgoingGroupMediaRetryUsesOwnPN(t *testing.T) {
+	ownPN := types.NewJID("111", types.DefaultUserServer)
+	ownLID := types.NewJID("999", types.HiddenUserServer)
+	client := &whatsmeow.Client{Store: &store.Device{ID: &ownPN, LID: ownLID}}
+	sender, err := resolveGroupMediaSender(context.Background(), client, "legacy-own-user", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sender != ownPN {
+		t.Fatalf("legacy outgoing group retry must use own PN, got %q", sender)
+	}
+}
+
+func TestEnsureSenderJIDColumnMigratesExistingMessageStore(t *testing.T) {
+	db, err := sql.Open("sqlite3", "file:"+filepath.Join(t.TempDir(), "messages.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("CREATE TABLE messages (id TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureMessageColumn(db, "sender_jid", "TEXT"); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query("PRAGMA table_info(messages)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		found = found || (name == "sender_jid" && dataType == "TEXT")
+	}
+	if !found {
+		t.Fatal("sender_jid column was not added")
 	}
 }
 
@@ -454,7 +725,7 @@ func TestConnectionWatchdogFailsAfterConsecutiveUnhealthyChecks(t *testing.T) {
 }
 
 func TestRESTServerReportsListenFailures(t *testing.T) {
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

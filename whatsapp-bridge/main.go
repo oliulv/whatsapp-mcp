@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -31,8 +33,11 @@ import (
 )
 
 const (
-	connectionCheckInterval  = 30 * time.Second
-	connectionUnhealthyLimit = 4
+	connectionCheckInterval   = 30 * time.Second
+	connectionUnhealthyLimit  = 4
+	mediaRetryResponseTimeout = 90 * time.Second
+	mediaRetrySendTimeout     = 15 * time.Second
+	mediaRetryResultTTL       = 5 * time.Minute
 )
 
 // Message represents a chat message for our client
@@ -47,12 +52,206 @@ type Message struct {
 
 // Database handler for storing message history
 type MessageStore struct {
-	db *sql.DB
+	db        *sql.DB
+	sessionDB *sql.DB
 }
 
 type connectionState interface {
 	IsConnected() bool
 	IsLoggedIn() bool
+}
+
+type mediaRetryKey struct {
+	chatJID   string
+	messageID types.MessageID
+}
+
+type mediaRetryResult struct {
+	directPath string
+	err        error
+}
+
+type pendingMediaRetry struct {
+	event       chan *events.MediaRetry
+	done        chan struct{}
+	result      mediaRetryResult
+	completedAt time.Time
+}
+
+type mediaRetryDecryptFunc func(*events.MediaRetry, []byte) (*waMmsRetry.MediaRetryNotification, error)
+type mediaRetrySendFunc func(context.Context, *types.MessageInfo, []byte) error
+
+type mediaRetryCoordinator struct {
+	mu      sync.Mutex
+	pending map[mediaRetryKey]*pendingMediaRetry
+	slots   chan struct{}
+	decrypt mediaRetryDecryptFunc
+}
+
+func newMediaRetryCoordinator(maxConcurrent int) *mediaRetryCoordinator {
+	if maxConcurrent < 1 {
+		maxConcurrent = 1
+	}
+	return &mediaRetryCoordinator{
+		pending: make(map[mediaRetryKey]*pendingMediaRetry),
+		slots:   make(chan struct{}, maxConcurrent),
+		decrypt: whatsmeow.DecryptMediaRetryNotification,
+	}
+}
+
+var mediaRetryRequests = newMediaRetryCoordinator(2)
+
+func (coordinator *mediaRetryCoordinator) handle(evt *events.MediaRetry) {
+	if coordinator == nil || evt == nil {
+		return
+	}
+	key := mediaRetryKey{chatJID: evt.ChatID.String(), messageID: evt.MessageID}
+	coordinator.mu.Lock()
+	pending := coordinator.pending[key]
+	coordinator.mu.Unlock()
+	if pending == nil {
+		return
+	}
+	select {
+	case <-pending.done:
+		return
+	default:
+	}
+	select {
+	case pending.event <- evt:
+	default:
+	}
+}
+
+func (coordinator *mediaRetryCoordinator) complete(
+	key mediaRetryKey,
+	pending *pendingMediaRetry,
+	result mediaRetryResult,
+) {
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if current := coordinator.pending[key]; current != pending {
+		return
+	}
+	pending.result = result
+	pending.completedAt = time.Now()
+	close(pending.done)
+	time.AfterFunc(mediaRetryResultTTL, func() {
+		coordinator.mu.Lock()
+		defer coordinator.mu.Unlock()
+		if coordinator.pending[key] == pending {
+			delete(coordinator.pending, key)
+		}
+	})
+}
+
+func (coordinator *mediaRetryCoordinator) request(
+	ctx context.Context,
+	messageInfo *types.MessageInfo,
+	mediaKey []byte,
+	send mediaRetrySendFunc,
+) (string, error) {
+	if coordinator == nil || messageInfo == nil || len(mediaKey) == 0 || send == nil {
+		return "", fmt.Errorf("media retry is not configured")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key := mediaRetryKey{chatJID: messageInfo.Chat.String(), messageID: messageInfo.ID}
+	coordinator.mu.Lock()
+	if existing := coordinator.pending[key]; existing != nil {
+		select {
+		case <-existing.done:
+			if time.Since(existing.completedAt) < mediaRetryResultTTL {
+				result := existing.result
+				coordinator.mu.Unlock()
+				return result.directPath, result.err
+			}
+			delete(coordinator.pending, key)
+		default:
+			coordinator.mu.Unlock()
+			select {
+			case <-existing.done:
+				return existing.result.directPath, existing.result.err
+			case <-ctx.Done():
+				return "", fmt.Errorf("media retry wait canceled: %w", ctx.Err())
+			}
+		}
+	}
+	pending := &pendingMediaRetry{
+		event: make(chan *events.MediaRetry, 1),
+		done:  make(chan struct{}),
+	}
+	coordinator.pending[key] = pending
+	coordinator.mu.Unlock()
+	messageInfoCopy := *messageInfo
+	mediaKeyCopy := append([]byte(nil), mediaKey...)
+	go coordinator.run(key, pending, &messageInfoCopy, mediaKeyCopy, send)
+
+	select {
+	case <-pending.done:
+		return pending.result.directPath, pending.result.err
+	case <-ctx.Done():
+		return "", fmt.Errorf("media retry wait canceled: %w", ctx.Err())
+	}
+}
+
+func (coordinator *mediaRetryCoordinator) run(
+	key mediaRetryKey,
+	pending *pendingMediaRetry,
+	messageInfo *types.MessageInfo,
+	mediaKey []byte,
+	send mediaRetrySendFunc,
+) {
+	operationContext, cancelOperation := context.WithTimeout(context.Background(), mediaRetryResponseTimeout)
+	defer cancelOperation()
+	result := mediaRetryResult{}
+	defer func() { coordinator.complete(key, pending, result) }()
+	select {
+	case coordinator.slots <- struct{}{}:
+		defer func() { <-coordinator.slots }()
+	case <-operationContext.Done():
+		result.err = fmt.Errorf("media retry capacity unavailable")
+		return
+	}
+
+	sendContext, cancelSend := context.WithTimeout(operationContext, mediaRetrySendTimeout)
+	err := send(sendContext, messageInfo, mediaKey)
+	cancelSend()
+	if err != nil {
+		result.err = fmt.Errorf("media retry receipt failed")
+		return
+	}
+
+	var evt *events.MediaRetry
+	select {
+	case evt = <-pending.event:
+	case <-operationContext.Done():
+		result.err = fmt.Errorf("media retry response unavailable")
+		return
+	}
+	if evt == nil || evt.MessageID != messageInfo.ID || evt.ChatID.String() != messageInfo.Chat.String() ||
+		evt.FromMe != messageInfo.IsFromMe {
+		result.err = fmt.Errorf("media retry response identity mismatch")
+		return
+	}
+	if messageInfo.IsGroup && !messageInfo.Sender.IsEmpty() &&
+		evt.SenderID.ToNonAD() != messageInfo.Sender.ToNonAD() {
+		result.err = fmt.Errorf("media retry response sender mismatch")
+		return
+	}
+	notification, err := coordinator.decrypt(evt, mediaKey)
+	if err != nil {
+		result.err = fmt.Errorf("media retry response could not be decrypted")
+		return
+	}
+	if notification == nil || notification.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS ||
+		notification.GetStanzaID() != string(messageInfo.ID) ||
+		!strings.HasPrefix(notification.GetDirectPath(), "/") {
+		result.err = fmt.Errorf("media retry response did not contain a valid attachment")
+		return
+	}
+	result.directPath = notification.GetDirectPath()
 }
 
 type HealthResponse struct {
@@ -179,6 +378,7 @@ func NewMessageStore() (*MessageStore, error) {
 			id TEXT,
 			chat_jid TEXT,
 			sender TEXT,
+			sender_jid TEXT,
 			content TEXT,
 			timestamp TIMESTAMP,
 			is_from_me BOOLEAN,
@@ -197,13 +397,66 @@ func NewMessageStore() (*MessageStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
+	if err := ensureMessageColumn(db, "sender_jid", "TEXT"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate message sender identity: %v", err)
+	}
 
-	return &MessageStore{db: db}, nil
+	var sessionDB *sql.DB
+	if _, statErr := os.Stat("store/whatsapp.db"); statErr == nil {
+		sessionDB, err = sql.Open("sqlite3", "file:store/whatsapp.db?mode=ro")
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to open sender identity store: %v", err)
+		}
+	}
+
+	return &MessageStore{db: db, sessionDB: sessionDB}, nil
+}
+
+func ensureMessageColumn(db *sql.DB, column, columnType string) error {
+	rows, err := db.Query("PRAGMA table_info(messages)")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	if column != "sender_jid" || columnType != "TEXT" {
+		return fmt.Errorf("unsupported message column migration")
+	}
+	_, err = db.Exec("ALTER TABLE messages ADD COLUMN sender_jid TEXT")
+	return err
 }
 
 // Close the database connection
 func (store *MessageStore) Close() error {
-	return store.db.Close()
+	var sessionErr error
+	if store.sessionDB != nil {
+		sessionErr = store.sessionDB.Close()
+	}
+	dbErr := store.db.Close()
+	if dbErr != nil {
+		return dbErr
+	}
+	return sessionErr
 }
 
 // Store a chat in the database
@@ -216,7 +469,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 }
 
 // Store a message in the database
-func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
+func (store *MessageStore) StoreMessage(id, chatJID, sender, senderJID, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
@@ -224,10 +477,10 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, sender_jid, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, senderJID, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
 }
@@ -365,6 +618,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		msg.Info.ID,
 		chatJID,
 		sender,
+		msg.Info.Sender.String(),
 		content,
 		msg.Info.Timestamp,
 		msg.Info.IsFromMe,
@@ -431,6 +685,151 @@ func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, str
 	).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
 
 	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
+}
+
+func (store *MessageStore) GetMessageSource(id, chatJID string) (sender, senderJID string, isFromMe bool, err error) {
+	err = store.db.QueryRow(
+		"SELECT sender, COALESCE(sender_jid, ''), is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
+		id, chatJID,
+	).Scan(&sender, &senderJID, &isFromMe)
+	return
+}
+
+func (store *MessageStore) GetExactSessionSender(
+	ctx context.Context,
+	id, chatJID, ownJID string,
+) (string, error) {
+	if store.sessionDB == nil || ownJID == "" {
+		return "", nil
+	}
+	rows, err := store.sessionDB.QueryContext(
+		ctx,
+		`SELECT DISTINCT sender_jid
+		 FROM whatsmeow_message_secrets
+		 WHERE our_jid = ? AND message_id = ? AND chat_jid = ? AND sender_jid <> ''
+		 LIMIT 2`,
+		ownJID,
+		id,
+		chatJID,
+	)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var senders []string
+	for rows.Next() {
+		var sender string
+		if err := rows.Scan(&sender); err != nil {
+			return "", err
+		}
+		senders = append(senders, sender)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if len(senders) > 1 {
+		return "", fmt.Errorf("multiple session senders matched one message")
+	}
+	if len(senders) == 1 {
+		return senders[0], nil
+	}
+	return "", nil
+}
+
+func resolveGroupMediaSender(
+	ctx context.Context,
+	client *whatsmeow.Client,
+	sender, senderJID string,
+	isFromMe bool,
+) (types.JID, error) {
+	if senderJID != "" {
+		parsed, err := types.ParseJID(senderJID)
+		if err != nil || parsed.IsEmpty() {
+			return types.EmptyJID, fmt.Errorf("stored group sender identity is invalid")
+		}
+		return parsed.ToNonAD(), nil
+	}
+	if strings.Contains(sender, "@") {
+		parsed, err := types.ParseJID(sender)
+		if err != nil || parsed.IsEmpty() {
+			return types.EmptyJID, fmt.Errorf("stored group sender identity is invalid")
+		}
+		return parsed.ToNonAD(), nil
+	}
+	if client == nil || client.Store == nil {
+		return types.EmptyJID, fmt.Errorf("group sender identity is unavailable")
+	}
+	if isFromMe {
+		if client.Store.ID != nil && !client.Store.ID.IsEmpty() {
+			return client.Store.ID.ToNonAD(), nil
+		}
+		return types.EmptyJID, fmt.Errorf("own group sender identity is unavailable")
+	}
+	if sender == "" {
+		return types.EmptyJID, fmt.Errorf("group sender identity is unavailable")
+	}
+
+	lidCandidate := types.NewJID(sender, types.HiddenUserServer)
+	pnCandidate := types.NewJID(sender, types.DefaultUserServer)
+	mappedPN, lidErr := client.Store.LIDs.GetPNForLID(ctx, lidCandidate)
+	mappedLID, pnErr := client.Store.LIDs.GetLIDForPN(ctx, pnCandidate)
+	if lidErr != nil || pnErr != nil {
+		return types.EmptyJID, fmt.Errorf("group sender identity lookup failed")
+	}
+	isLID := !mappedPN.IsEmpty()
+	isPN := !mappedLID.IsEmpty()
+	if isLID == isPN {
+		return types.EmptyJID, fmt.Errorf("group sender identity is ambiguous")
+	}
+	if isLID {
+		return lidCandidate, nil
+	}
+	return pnCandidate, nil
+}
+
+func mediaRetryMessageInfo(
+	ctx context.Context,
+	client *whatsmeow.Client,
+	messageStore *MessageStore,
+	messageID, chatJID string,
+) (*types.MessageInfo, error) {
+	chat, err := types.ParseJID(chatJID)
+	if err != nil || chat.IsEmpty() {
+		return nil, fmt.Errorf("stored media chat identity is invalid")
+	}
+	sender, senderJID, isFromMe, err := messageStore.GetMessageSource(messageID, chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("stored media source identity is unavailable")
+	}
+	info := &types.MessageInfo{
+		ID: types.MessageID(messageID),
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			IsFromMe: isFromMe,
+			IsGroup:  chat.Server == types.GroupServer,
+		},
+	}
+	if info.IsGroup {
+		if senderJID == "" {
+			if client == nil || client.Store == nil || client.Store.ID == nil {
+				return nil, fmt.Errorf("active account identity is unavailable")
+			}
+			senderJID, err = messageStore.GetExactSessionSender(
+				ctx,
+				messageID,
+				chatJID,
+				client.Store.ID.String(),
+			)
+			if err != nil {
+				return nil, fmt.Errorf("exact group sender identity lookup failed")
+			}
+		}
+		info.Sender, err = resolveGroupMediaSender(ctx, client, sender, senderJID, isFromMe)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return info, nil
 }
 
 func mediaLocalPath(chatDir, filename, messageID string) string {
@@ -644,6 +1043,18 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
+	return downloadMediaContext(context.Background(), client, messageStore, messageID, chatJID)
+}
+
+func downloadMediaContext(
+	ctx context.Context,
+	client *whatsmeow.Client,
+	messageStore *MessageStore,
+	messageID, chatJID string,
+) (bool, string, string, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Query the database for the message
 	var mediaType, filename, url string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -754,14 +1165,53 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// short-lived host signature. If that URL has expired, retry the exact
 	// message-bound DirectPath through whatsmeow's fresh media connection before
 	// considering a protocol-level media retry receipt.
-	downloadContext, cancelDownload := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancelDownload()
+	downloadContext, cancelDownload := context.WithTimeout(ctx, 2*time.Minute)
 	mediaData, err := client.Download(downloadContext, downloader)
 	if err != nil && retryableExpiredMediaError(err) && directPath != "" {
 		directPathDownloader := *downloader
 		directPathDownloader.URL = ""
 		directPathDownloader.DirectPath = directPath
 		mediaData, err = client.Download(downloadContext, &directPathDownloader)
+	}
+	cancelDownload()
+	if err != nil && retryableExpiredMediaError(err) {
+		// This encrypted server-error receipt is addressed only to the account's
+		// own linked phone. It requests re-upload of the already-received media;
+		// it is not a chat message, is never exposed through MCP, and cannot target
+		// a contact. One receipt is allowed only after both receive-side paths have
+		// returned a terminal expiry response.
+		retryContext, cancelRetry := context.WithTimeout(ctx, mediaRetryResponseTimeout)
+		messageInfo, infoErr := mediaRetryMessageInfo(
+			retryContext,
+			client,
+			messageStore,
+			messageID,
+			chatJID,
+		)
+		if infoErr == nil {
+			var refreshedDirectPath string
+			refreshedDirectPath, infoErr = mediaRetryRequests.request(
+				retryContext,
+				messageInfo,
+				mediaKey,
+				client.SendMediaRetryReceipt,
+			)
+			if infoErr == nil {
+				refreshedDownloader := *downloader
+				refreshedDownloader.URL = ""
+				refreshedDownloader.DirectPath = refreshedDirectPath
+				refreshedDownloadContext, cancelRefreshedDownload := context.WithTimeout(
+					ctx,
+					2*time.Minute,
+				)
+				mediaData, err = client.Download(refreshedDownloadContext, &refreshedDownloader)
+				cancelRefreshedDownload()
+			}
+		}
+		cancelRetry()
+		if infoErr != nil {
+			err = fmt.Errorf("expired media recovery unavailable")
+		}
 	}
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
@@ -829,7 +1279,13 @@ func newRESTMux(client *whatsmeow.Client, health connectionState, messageStore *
 		}
 
 		// Download the media
-		success, mediaType, filename, path, err := downloadMedia(client, messageStore, req.MessageID, req.ChatJID)
+		success, mediaType, filename, path, err := downloadMediaContext(
+			r.Context(),
+			client,
+			messageStore,
+			req.MessageID,
+			req.ChatJID,
+		)
 
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -865,7 +1321,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	mux := newRESTMux(client, client, messageStore)
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// The bridge REST API can trigger an own-device media retry receipt, so it
+	// is a local control plane only. Tailnet clients use the read-only MCP
+	// service on its separate port; never expose this endpoint directly.
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 	server := &http.Server{Addr: serverAddr, Handler: mux}
 	failures := make(chan error, 1)
@@ -947,6 +1406,11 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.MediaRetry:
+			// Complete only an internally pending receive-side media recovery.
+			// This event is never exposed as a REST or MCP write capability.
+			mediaRetryRequests.handle(v)
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -1215,21 +1679,25 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Determine sender
-				var sender string
+				var sender, senderJID string
 				isFromMe := false
 				if msg.Message.Key != nil {
 					if msg.Message.Key.FromMe != nil {
 						isFromMe = *msg.Message.Key.FromMe
 					}
-					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
+					if msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
 						sender = *msg.Message.Key.Participant
+						senderJID = *msg.Message.Key.Participant
 					} else if isFromMe {
 						sender = client.Store.ID.User
+						senderJID = client.Store.ID.ToNonAD().String()
 					} else {
 						sender = jid.User
+						senderJID = jid.String()
 					}
 				} else {
 					sender = jid.User
+					senderJID = jid.String()
 				}
 
 				// Store message
@@ -1250,6 +1718,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					msgID,
 					chatJID,
 					sender,
+					senderJID,
 					content,
 					timestamp,
 					isFromMe,
