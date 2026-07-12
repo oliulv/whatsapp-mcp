@@ -503,7 +503,30 @@ func writeMediaReaderAtomically(path string, source io.Reader, expected []byte, 
 	if err := os.Rename(temporaryPath, path); err != nil {
 		return err
 	}
-	return os.Chmod(path, 0600)
+	if err := os.Chmod(path, 0600); err != nil {
+		return err
+	}
+	finalFile, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	if err := finalFile.Sync(); err != nil {
+		finalFile.Close()
+		return err
+	}
+	if err := finalFile.Close(); err != nil {
+		return err
+	}
+	return syncMediaDirectory(filepath.Dir(path))
+}
+
+func syncMediaDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func writeMediaFileAtomically(path string, data []byte) error {
@@ -560,6 +583,12 @@ func migrateLegacyMediaFile(legacyPath, localPath string, expected []byte, expec
 		return false, fmt.Errorf("migrated media failed final checksum verification")
 	}
 	if err := os.Remove(legacyPath); err != nil && !os.IsNotExist(err) {
+		if chmodErr := os.Chmod(legacyPath, 0600); chmodErr != nil {
+			return false, fmt.Errorf("could not remove or secure legacy media: %v; chmod: %v", err, chmodErr)
+		}
+		return true, err
+	}
+	if err := syncMediaDirectory(filepath.Dir(legacyPath)); err != nil {
 		return true, err
 	}
 	return true, nil
