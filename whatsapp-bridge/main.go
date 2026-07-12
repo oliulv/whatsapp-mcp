@@ -25,6 +25,11 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
+const (
+	connectionCheckInterval  = 30 * time.Second
+	connectionUnhealthyLimit = 4
+)
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -38,6 +43,110 @@ type Message struct {
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
+}
+
+type connectionState interface {
+	IsConnected() bool
+	IsLoggedIn() bool
+}
+
+type HealthResponse struct {
+	Status                 string `json:"status"`
+	Connected              bool   `json:"connected"`
+	LoggedIn               bool   `json:"logged_in"`
+	MessageCount           int64  `json:"message_count"`
+	LatestMessageTimestamp string `json:"latest_message_timestamp,omitempty"`
+}
+
+func permanentDisconnectError(evt interface{}) error {
+	disconnect, ok := evt.(events.PermanentDisconnect)
+	if !ok {
+		return nil
+	}
+	return fmt.Errorf("permanent WhatsApp disconnect: %s", disconnect.PermanentDisconnectDescription())
+}
+
+func monitorConnection(ctx context.Context, client connectionState, ticks <-chan time.Time, unhealthyLimit int) error {
+	consecutiveUnhealthy := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticks:
+			connected := client.IsConnected()
+			loggedIn := client.IsLoggedIn()
+			if connected && loggedIn {
+				consecutiveUnhealthy = 0
+				continue
+			}
+
+			consecutiveUnhealthy++
+			if consecutiveUnhealthy >= unhealthyLimit {
+				return fmt.Errorf(
+					"WhatsApp connection unhealthy for %d consecutive checks (connected=%t, logged_in=%t)",
+					consecutiveUnhealthy,
+					connected,
+					loggedIn,
+				)
+			}
+		}
+	}
+}
+
+func waitForRuntimeExit(
+	signals <-chan os.Signal,
+	permanentDisconnects <-chan error,
+	watchdogFailures <-chan error,
+	serverFailures <-chan error,
+) error {
+	select {
+	case <-signals:
+		return nil
+	case err := <-permanentDisconnects:
+		return err
+	case err := <-watchdogFailures:
+		return err
+	case err := <-serverFailures:
+		return err
+	}
+}
+
+func (store *MessageStore) sourceWatermark() (int64, string, error) {
+	var count int64
+	var latest string
+	err := store.db.QueryRow(
+		"SELECT COUNT(*), COALESCE(MAX(timestamp), '') FROM messages",
+	).Scan(&count, &latest)
+	return count, latest, err
+}
+
+func newHealthHandler(client connectionState, messageStore *MessageStore) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		count, latest, err := messageStore.sourceWatermark()
+		if err != nil {
+			http.Error(w, "failed to read message source watermark", http.StatusInternalServerError)
+			return
+		}
+
+		connected := client.IsConnected()
+		loggedIn := client.IsLoggedIn()
+		status := "healthy"
+		statusCode := http.StatusOK
+		if !connected || !loggedIn {
+			status = "unhealthy"
+			statusCode = http.StatusServiceUnavailable
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		_ = json.NewEncoder(w).Encode(HealthResponse{
+			Status:                 status,
+			Connected:              connected,
+			LoggedIn:               loggedIn,
+			MessageCount:           count,
+			LatestMessageTimestamp: latest,
+		})
+	})
 }
 
 // Initialize message store
@@ -487,10 +596,12 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func newRESTMux(client *whatsmeow.Client, health connectionState, messageStore *MessageStore) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/api/health", newHealthHandler(health, messageStore))
+
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -539,17 +650,27 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Path:     path,
 		})
 	})
+	return mux
+}
+
+// Start a REST API server to expose the WhatsApp client functionality
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) (*http.Server, <-chan error) {
+	mux := newRESTMux(client, client, messageStore)
 
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	server := &http.Server{Addr: serverAddr, Handler: mux}
+	failures := make(chan error, 1)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("REST API server error: %v\n", err)
+			failures <- err
 		}
 	}()
+	return server, failures
 }
 
 func main() {
@@ -599,9 +720,18 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+	permanentDisconnects := make(chan error, 1)
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
+		if err := permanentDisconnectError(evt); err != nil {
+			logger.Errorf("%v", err)
+			select {
+			case permanentDisconnects <- err:
+			default:
+			}
+		}
+
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
@@ -672,20 +802,51 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	server, serverFailures := startRESTServer(client, messageStore, 8080)
+
+	watchdogContext, cancelWatchdog := context.WithCancel(context.Background())
+	watchdogTicker := time.NewTicker(connectionCheckInterval)
+	watchdogFailures := make(chan error, 1)
+	go func() {
+		if err := monitorConnection(
+			watchdogContext,
+			client,
+			watchdogTicker.C,
+			connectionUnhealthyLimit,
+		); err != nil {
+			watchdogFailures <- err
+		}
+	}()
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(exitChan)
 
 	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
 
-	// Wait for termination signal
-	<-exitChan
+	// Wait for a graceful signal or a runtime failure that systemd must restart.
+	runtimeErr := waitForRuntimeExit(exitChan, permanentDisconnects, watchdogFailures, serverFailures)
+	cancelWatchdog()
+	watchdogTicker.Stop()
+
+	shutdownContext, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := server.Shutdown(shutdownContext); err != nil {
+		logger.Warnf("REST API shutdown failed: %v", err)
+	}
+	cancelShutdown()
 
 	fmt.Println("Disconnecting...")
 	// Disconnect client
 	client.Disconnect()
+
+	if runtimeErr != nil {
+		logger.Errorf("Bridge stopped after runtime failure: %v", runtimeErr)
+		if err := messageStore.Close(); err != nil {
+			logger.Warnf("Failed to close message store: %v", err)
+		}
+		os.Exit(1)
+	}
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info
