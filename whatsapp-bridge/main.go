@@ -108,6 +108,29 @@ func (coordinator *mediaRetryCoordinator) handle(evt *events.MediaRetry) {
 	key := mediaRetryKey{chatJID: evt.ChatID.String(), messageID: evt.MessageID}
 	coordinator.mu.Lock()
 	pending := coordinator.pending[key]
+	if pending == nil {
+		// Direct-chat notifications may come back through the PN/LID alternate
+		// address. Message IDs plus the media-key-authenticated notification are
+		// sufficient when exactly one in-flight request has that ID. Groups still
+		// require their exact chat identity in run().
+		var candidate *pendingMediaRetry
+		for pendingKey, possible := range coordinator.pending {
+			if pendingKey.messageID != evt.MessageID {
+				continue
+			}
+			select {
+			case <-possible.done:
+				continue
+			default:
+			}
+			if candidate != nil {
+				candidate = nil
+				break
+			}
+			candidate = possible
+		}
+		pending = candidate
+	}
 	coordinator.mu.Unlock()
 	if pending == nil {
 		return
@@ -230,19 +253,27 @@ func (coordinator *mediaRetryCoordinator) run(
 		result.err = fmt.Errorf("media retry response unavailable")
 		return
 	}
-	if evt == nil || evt.MessageID != messageInfo.ID || evt.ChatID.String() != messageInfo.Chat.String() ||
-		evt.FromMe != messageInfo.IsFromMe {
+	if evt == nil || evt.MessageID != messageInfo.ID || evt.FromMe != messageInfo.IsFromMe {
 		result.err = fmt.Errorf("media retry response identity mismatch")
 		return
 	}
-	if messageInfo.IsGroup && !messageInfo.Sender.IsEmpty() &&
-		evt.SenderID.ToNonAD() != messageInfo.Sender.ToNonAD() {
-		result.err = fmt.Errorf("media retry response sender mismatch")
-		return
+	if messageInfo.IsGroup {
+		if evt.ChatID.String() != messageInfo.Chat.String() {
+			result.err = fmt.Errorf("media retry response chat mismatch")
+			return
+		}
+		if !messageInfo.Sender.IsEmpty() && evt.SenderID.ToNonAD() != messageInfo.Sender.ToNonAD() {
+			result.err = fmt.Errorf("media retry response sender mismatch")
+			return
+		}
 	}
 	notification, err := coordinator.decrypt(evt, mediaKey)
 	if err != nil {
-		result.err = fmt.Errorf("media retry response could not be decrypted")
+		if errors.Is(err, whatsmeow.ErrMediaNotAvailableOnPhone) {
+			result.err = fmt.Errorf("media retry reported unavailable on linked phone")
+		} else {
+			result.err = fmt.Errorf("media retry response could not be decrypted")
+		}
 		return
 	}
 	if notification == nil || notification.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS ||
@@ -1210,7 +1241,7 @@ func downloadMediaContext(
 		}
 		cancelRetry()
 		if infoErr != nil {
-			err = fmt.Errorf("expired media recovery unavailable")
+			err = fmt.Errorf("expired media recovery unavailable: %w", infoErr)
 		}
 	}
 	if err != nil {

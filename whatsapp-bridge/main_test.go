@@ -103,6 +103,73 @@ func TestMediaRetryRegistersBeforeFastResponse(t *testing.T) {
 	}
 }
 
+func TestDirectMediaRetryAcceptsPNLIDAlternateResponse(t *testing.T) {
+	coordinator := newMediaRetryCoordinator(1)
+	coordinator.decrypt = func(*events.MediaRetry, []byte) (*waMmsRetry.MediaRetryNotification, error) {
+		return &waMmsRetry.MediaRetryNotification{
+			StanzaID:   proto.String("message-1"),
+			DirectPath: proto.String("/fresh/path?token=value"),
+			Result:     waMmsRetry.MediaRetryNotification_SUCCESS.Enum(),
+		}, nil
+	}
+	info := &types.MessageInfo{
+		ID: types.MessageID("message-1"),
+		MessageSource: types.MessageSource{
+			Chat: types.NewJID("12345", types.DefaultUserServer),
+		},
+	}
+	path, err := coordinator.request(
+		context.Background(),
+		info,
+		[]byte("media-key"),
+		func(context.Context, *types.MessageInfo, []byte) error {
+			coordinator.handle(&events.MediaRetry{
+				MessageID: info.ID,
+				ChatID:    types.NewJID("67890", types.HiddenUserServer),
+			})
+			return nil
+		},
+	)
+	if err != nil || path != "/fresh/path?token=value" {
+		t.Fatalf("PN/LID alternate response was not accepted: path=%q err=%v", path, err)
+	}
+}
+
+func TestGroupMediaRetryRejectsAlternateChatResponse(t *testing.T) {
+	coordinator := newMediaRetryCoordinator(1)
+	coordinator.decrypt = func(*events.MediaRetry, []byte) (*waMmsRetry.MediaRetryNotification, error) {
+		return &waMmsRetry.MediaRetryNotification{
+			StanzaID:   proto.String("message-1"),
+			DirectPath: proto.String("/fresh/path?token=value"),
+			Result:     waMmsRetry.MediaRetryNotification_SUCCESS.Enum(),
+		}, nil
+	}
+	info := &types.MessageInfo{
+		ID: types.MessageID("message-1"),
+		MessageSource: types.MessageSource{
+			Chat:    types.NewJID("12345", types.GroupServer),
+			Sender:  types.NewJID("11111", types.DefaultUserServer),
+			IsGroup: true,
+		},
+	}
+	path, err := coordinator.request(
+		context.Background(),
+		info,
+		[]byte("media-key"),
+		func(context.Context, *types.MessageInfo, []byte) error {
+			coordinator.handle(&events.MediaRetry{
+				MessageID: info.ID,
+				ChatID:    types.NewJID("67890", types.GroupServer),
+				SenderID:  info.Sender,
+			})
+			return nil
+		},
+	)
+	if err == nil || path != "" {
+		t.Fatalf("alternate group chat response was accepted: path=%q err=%v", path, err)
+	}
+}
+
 func TestConcurrentMediaRetriesShareOneReceipt(t *testing.T) {
 	coordinator := newMediaRetryCoordinator(1)
 	coordinator.decrypt = func(*events.MediaRetry, []byte) (*waMmsRetry.MediaRetryNotification, error) {
