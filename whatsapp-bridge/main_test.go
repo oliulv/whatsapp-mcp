@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types/events"
 )
 
@@ -30,6 +31,32 @@ func TestMediaLocalPathIsBoundToMessageID(t *testing.T) {
 	}
 	if filepath.Ext(first) != ".ogg" {
 		t.Fatalf("expected original media extension, got %q", first)
+	}
+}
+
+func TestExtractDirectPathPreservesMediaQuery(t *testing.T) {
+	fullURL := "https://mmg.whatsapp.net/v/t62/example.enc?ccb=11-4&oh=signed-value"
+	want := "/v/t62/example.enc?ccb=11-4&oh=signed-value"
+	if got := extractDirectPathFromURL(fullURL); got != want {
+		t.Fatalf("direct path query was not preserved: got %q want %q", got, want)
+	}
+	if got := extractDirectPathFromURL(want); got != want {
+		t.Fatalf("existing direct path changed: got %q want %q", got, want)
+	}
+}
+
+func TestExpiredMediaErrorsUseDirectPathFallback(t *testing.T) {
+	for _, err := range []error{
+		whatsmeow.ErrMediaDownloadFailedWith403,
+		whatsmeow.ErrMediaDownloadFailedWith404,
+		whatsmeow.ErrMediaDownloadFailedWith410,
+	} {
+		if !retryableExpiredMediaError(err) {
+			t.Fatalf("expected %v to use the direct-path fallback", err)
+		}
+	}
+	if retryableExpiredMediaError(context.Canceled) {
+		t.Fatal("context cancellation must not trigger a second media request")
 	}
 }
 

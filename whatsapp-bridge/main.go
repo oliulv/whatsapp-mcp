@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	urlpkg "net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -748,8 +750,19 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(context.Background(), downloader)
+	// Download the media using whatsmeow client. Stored full URLs carry a
+	// short-lived host signature. If that URL has expired, retry the exact
+	// message-bound DirectPath through whatsmeow's fresh media connection before
+	// considering a protocol-level media retry receipt.
+	downloadContext, cancelDownload := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelDownload()
+	mediaData, err := client.Download(downloadContext, downloader)
+	if err != nil && retryableExpiredMediaError(err) && directPath != "" {
+		directPathDownloader := *downloader
+		directPathDownloader.URL = ""
+		directPathDownloader.DirectPath = directPath
+		mediaData, err = client.Download(downloadContext, &directPathDownloader)
+	}
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -770,22 +783,24 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 // Extract direct path from a WhatsApp media URL
 func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
-
-	// Find the path part after the domain
-	parts := strings.SplitN(url, ".net/", 2)
-	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+	// DirectPath includes its query string. whatsmeow appends the current media
+	// host plus checksum parameters to this value, so stripping the query turns
+	// an otherwise recoverable attachment into another 403.
+	parsed, err := urlpkg.Parse(url)
+	if err != nil || parsed.Path == "" {
+		return url
 	}
+	directPath := parsed.EscapedPath()
+	if parsed.RawQuery != "" {
+		directPath += "?" + parsed.RawQuery
+	}
+	return directPath
+}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+func retryableExpiredMediaError(err error) bool {
+	return errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
+		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410)
 }
 
 func newRESTMux(client *whatsmeow.Client, health connectionState, messageStore *MessageStore) *http.ServeMux {
