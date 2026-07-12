@@ -81,6 +81,11 @@ type pendingMediaRetry struct {
 type mediaRetryDecryptFunc func(*events.MediaRetry, []byte) (*waMmsRetry.MediaRetryNotification, error)
 type mediaRetrySendFunc func(context.Context, *types.MessageInfo, []byte) error
 
+type mediaRetryLIDStore interface {
+	GetPNForLID(context.Context, types.JID) (types.JID, error)
+	GetLIDForPN(context.Context, types.JID) (types.JID, error)
+}
+
 type mediaRetryCoordinator struct {
 	mu      sync.Mutex
 	pending map[mediaRetryKey]*pendingMediaRetry
@@ -173,6 +178,7 @@ func (coordinator *mediaRetryCoordinator) request(
 	messageInfo *types.MessageInfo,
 	mediaKey []byte,
 	send mediaRetrySendFunc,
+	lidStore mediaRetryLIDStore,
 ) (string, error) {
 	if coordinator == nil || messageInfo == nil || len(mediaKey) == 0 || send == nil {
 		return "", fmt.Errorf("media retry is not configured")
@@ -209,7 +215,7 @@ func (coordinator *mediaRetryCoordinator) request(
 	coordinator.mu.Unlock()
 	messageInfoCopy := *messageInfo
 	mediaKeyCopy := append([]byte(nil), mediaKey...)
-	go coordinator.run(key, pending, &messageInfoCopy, mediaKeyCopy, send)
+	go coordinator.run(key, pending, &messageInfoCopy, mediaKeyCopy, send, lidStore)
 
 	select {
 	case <-pending.done:
@@ -225,6 +231,7 @@ func (coordinator *mediaRetryCoordinator) run(
 	messageInfo *types.MessageInfo,
 	mediaKey []byte,
 	send mediaRetrySendFunc,
+	lidStore mediaRetryLIDStore,
 ) {
 	operationContext, cancelOperation := context.WithTimeout(context.Background(), mediaRetryResponseTimeout)
 	defer cancelOperation()
@@ -262,9 +269,17 @@ func (coordinator *mediaRetryCoordinator) run(
 			result.err = fmt.Errorf("media retry response chat mismatch")
 			return
 		}
-		if !messageInfo.Sender.IsEmpty() && evt.SenderID.ToNonAD() != messageInfo.Sender.ToNonAD() {
-			result.err = fmt.Errorf("media retry response sender mismatch")
-			return
+		if !messageInfo.Sender.IsEmpty() {
+			senderMatches, senderErr := groupMediaRetrySenderMatches(
+				operationContext,
+				lidStore,
+				messageInfo.Sender,
+				evt.SenderID,
+			)
+			if senderErr != nil || !senderMatches {
+				result.err = fmt.Errorf("media retry response sender mismatch")
+				return
+			}
 		}
 	}
 	notification, err := coordinator.decrypt(evt, mediaKey)
@@ -283,6 +298,47 @@ func (coordinator *mediaRetryCoordinator) run(
 		return
 	}
 	result.directPath = notification.GetDirectPath()
+}
+
+func groupMediaRetrySenderMatches(
+	ctx context.Context,
+	lidStore mediaRetryLIDStore,
+	expected, actual types.JID,
+) (bool, error) {
+	expected = expected.ToNonAD()
+	actual = actual.ToNonAD()
+	if expected == actual {
+		return true, nil
+	}
+	if expected.IsEmpty() || actual.IsEmpty() {
+		return false, nil
+	}
+
+	var pn, lid types.JID
+	switch {
+	case expected.Server == types.DefaultUserServer && actual.Server == types.HiddenUserServer:
+		pn, lid = expected, actual
+	case expected.Server == types.HiddenUserServer && actual.Server == types.DefaultUserServer:
+		pn, lid = actual, expected
+	default:
+		return false, nil
+	}
+	if lidStore == nil {
+		return false, fmt.Errorf("group sender identity mapping is unavailable")
+	}
+
+	mappedLID, err := lidStore.GetLIDForPN(ctx, pn)
+	if err != nil {
+		return false, fmt.Errorf("group sender PN lookup failed: %w", err)
+	}
+	mappedPN, err := lidStore.GetPNForLID(ctx, lid)
+	if err != nil {
+		return false, fmt.Errorf("group sender LID lookup failed: %w", err)
+	}
+	if mappedLID.IsEmpty() || mappedPN.IsEmpty() {
+		return false, nil
+	}
+	return mappedLID.ToNonAD() == lid && mappedPN.ToNonAD() == pn, nil
 }
 
 type HealthResponse struct {
@@ -1221,11 +1277,16 @@ func downloadMediaContext(
 		)
 		if infoErr == nil {
 			var refreshedDirectPath string
+			var lidStore mediaRetryLIDStore
+			if client.Store != nil {
+				lidStore = client.Store.LIDs
+			}
 			refreshedDirectPath, infoErr = mediaRetryRequests.request(
 				retryContext,
 				messageInfo,
 				mediaKey,
 				client.SendMediaRetryReceipt,
+				lidStore,
 			)
 			if infoErr == nil {
 				refreshedDownloader := *downloader

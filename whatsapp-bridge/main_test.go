@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -25,6 +26,33 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
+
+type testMediaRetryLIDStore struct {
+	pnToLID map[string]types.JID
+	lidToPN map[string]types.JID
+	err     error
+}
+
+func (store *testMediaRetryLIDStore) GetLIDForPN(_ context.Context, pn types.JID) (types.JID, error) {
+	if store.err != nil {
+		return types.EmptyJID, store.err
+	}
+	return store.pnToLID[pn.ToNonAD().String()], nil
+}
+
+func (store *testMediaRetryLIDStore) GetPNForLID(_ context.Context, lid types.JID) (types.JID, error) {
+	if store.err != nil {
+		return types.EmptyJID, store.err
+	}
+	return store.lidToPN[lid.ToNonAD().String()], nil
+}
+
+func provenMediaRetryLIDStore(pn, lid types.JID) *testMediaRetryLIDStore {
+	return &testMediaRetryLIDStore{
+		pnToLID: map[string]types.JID{pn.ToNonAD().String(): lid.ToNonAD()},
+		lidToPN: map[string]types.JID{lid.ToNonAD().String(): pn.ToNonAD()},
+	}
+}
 
 func TestMediaLocalPathIsBoundToMessageID(t *testing.T) {
 	chatDir := filepath.Join("store", "example-chat")
@@ -94,6 +122,7 @@ func TestMediaRetryRegistersBeforeFastResponse(t *testing.T) {
 			})
 			return nil
 		},
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -129,9 +158,113 @@ func TestDirectMediaRetryAcceptsPNLIDAlternateResponse(t *testing.T) {
 			})
 			return nil
 		},
+		nil,
 	)
 	if err != nil || path != "/fresh/path?token=value" {
 		t.Fatalf("PN/LID alternate response was not accepted: path=%q err=%v", path, err)
+	}
+}
+
+func TestGroupMediaRetryAcceptsProvenPNLIDAlternateSender(t *testing.T) {
+	pn := types.NewJID("11111", types.DefaultUserServer)
+	lid := types.NewJID("22222", types.HiddenUserServer)
+	for _, test := range []struct {
+		name     string
+		expected types.JID
+		actual   types.JID
+	}{
+		{name: "expected PN response LID", expected: pn, actual: lid},
+		{name: "expected LID response PN", expected: lid, actual: pn},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator := newMediaRetryCoordinator(1)
+			coordinator.decrypt = func(*events.MediaRetry, []byte) (*waMmsRetry.MediaRetryNotification, error) {
+				return &waMmsRetry.MediaRetryNotification{
+					StanzaID:   proto.String("message-1"),
+					DirectPath: proto.String("/fresh/path?token=value"),
+					Result:     waMmsRetry.MediaRetryNotification_SUCCESS.Enum(),
+				}, nil
+			}
+			info := &types.MessageInfo{
+				ID: types.MessageID("message-1"),
+				MessageSource: types.MessageSource{
+					Chat:    types.NewJID("12345", types.GroupServer),
+					Sender:  test.expected,
+					IsGroup: true,
+				},
+			}
+			path, err := coordinator.request(
+				context.Background(),
+				info,
+				[]byte("media-key"),
+				func(context.Context, *types.MessageInfo, []byte) error {
+					coordinator.handle(&events.MediaRetry{
+						MessageID: info.ID,
+						ChatID:    info.Chat,
+						SenderID:  test.actual,
+					})
+					return nil
+				},
+				provenMediaRetryLIDStore(pn, lid),
+			)
+			if err != nil || path != "/fresh/path?token=value" {
+				t.Fatalf("proven PN/LID group sender alternate was not accepted: path=%q err=%v", path, err)
+			}
+		})
+	}
+}
+
+func TestGroupMediaRetryRejectsUnprovenOrWrongAlternateSender(t *testing.T) {
+	pn := types.NewJID("11111", types.DefaultUserServer)
+	lid := types.NewJID("22222", types.HiddenUserServer)
+	wrongPN := types.NewJID("33333", types.DefaultUserServer)
+	wrongLID := types.NewJID("44444", types.HiddenUserServer)
+	tests := []struct {
+		name   string
+		actual types.JID
+		store  mediaRetryLIDStore
+	}{
+		{name: "missing mapping", actual: lid, store: &testMediaRetryLIDStore{}},
+		{name: "wrong sender", actual: wrongLID, store: provenMediaRetryLIDStore(wrongPN, wrongLID)},
+		{
+			name:   "inconsistent mapping",
+			actual: lid,
+			store: &testMediaRetryLIDStore{
+				pnToLID: map[string]types.JID{pn.String(): lid},
+				lidToPN: map[string]types.JID{lid.String(): wrongPN},
+			},
+		},
+		{name: "lookup error", actual: lid, store: &testMediaRetryLIDStore{err: errors.New("lookup failed")}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			coordinator := newMediaRetryCoordinator(1)
+			info := &types.MessageInfo{
+				ID: types.MessageID("message-1"),
+				MessageSource: types.MessageSource{
+					Chat:    types.NewJID("12345", types.GroupServer),
+					Sender:  pn,
+					IsGroup: true,
+				},
+			}
+			path, err := coordinator.request(
+				context.Background(),
+				info,
+				[]byte("media-key"),
+				func(context.Context, *types.MessageInfo, []byte) error {
+					coordinator.handle(&events.MediaRetry{
+						MessageID: info.ID,
+						ChatID:    info.Chat,
+						SenderID:  test.actual,
+					})
+					return nil
+				},
+				test.store,
+			)
+			if err == nil || !strings.Contains(err.Error(), "sender mismatch") || path != "" {
+				t.Fatalf("unproven group sender was accepted: path=%q err=%v", path, err)
+			}
+		})
 	}
 }
 
@@ -144,11 +277,13 @@ func TestGroupMediaRetryRejectsAlternateChatResponse(t *testing.T) {
 			Result:     waMmsRetry.MediaRetryNotification_SUCCESS.Enum(),
 		}, nil
 	}
+	pn := types.NewJID("11111", types.DefaultUserServer)
+	lid := types.NewJID("22222", types.HiddenUserServer)
 	info := &types.MessageInfo{
 		ID: types.MessageID("message-1"),
 		MessageSource: types.MessageSource{
 			Chat:    types.NewJID("12345", types.GroupServer),
-			Sender:  types.NewJID("11111", types.DefaultUserServer),
+			Sender:  pn,
 			IsGroup: true,
 		},
 	}
@@ -160,13 +295,14 @@ func TestGroupMediaRetryRejectsAlternateChatResponse(t *testing.T) {
 			coordinator.handle(&events.MediaRetry{
 				MessageID: info.ID,
 				ChatID:    types.NewJID("67890", types.GroupServer),
-				SenderID:  info.Sender,
+				SenderID:  lid,
 			})
 			return nil
 		},
+		provenMediaRetryLIDStore(pn, lid),
 	)
-	if err == nil || path != "" {
-		t.Fatalf("alternate group chat response was accepted: path=%q err=%v", path, err)
+	if err == nil || !strings.Contains(err.Error(), "chat mismatch") || path != "" {
+		t.Fatalf("alternate group chat response was not rejected by chat identity: path=%q err=%v", path, err)
 	}
 }
 
@@ -203,7 +339,7 @@ func TestConcurrentMediaRetriesShareOneReceipt(t *testing.T) {
 	for range 2 {
 		go func() {
 			defer wait.Done()
-			path, err := coordinator.request(context.Background(), info, []byte("media-key"), send)
+			path, err := coordinator.request(context.Background(), info, []byte("media-key"), send, nil)
 			if err == nil && path != "/fresh/path?token=value" {
 				err = fmt.Errorf("unexpected refreshed direct path %q", path)
 			}
@@ -254,7 +390,7 @@ func TestCanceledWaiterDoesNotPoisonSharedMediaRetry(t *testing.T) {
 	firstContext, cancelFirst := context.WithCancel(context.Background())
 	firstResult := make(chan error, 1)
 	go func() {
-		_, err := coordinator.request(firstContext, info, []byte("media-key"), send)
+		_, err := coordinator.request(firstContext, info, []byte("media-key"), send, nil)
 		firstResult <- err
 	}()
 	<-started
@@ -265,7 +401,7 @@ func TestCanceledWaiterDoesNotPoisonSharedMediaRetry(t *testing.T) {
 
 	secondResult := make(chan mediaRetryResult, 1)
 	go func() {
-		path, err := coordinator.request(context.Background(), info, []byte("media-key"), send)
+		path, err := coordinator.request(context.Background(), info, []byte("media-key"), send, nil)
 		secondResult <- mediaRetryResult{directPath: path, err: err}
 	}()
 	close(release)
@@ -298,6 +434,7 @@ func TestMediaRetryRejectsWrongResponseIdentity(t *testing.T) {
 			})
 			return nil
 		},
+		nil,
 	)
 	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
 		t.Fatalf("expected response identity mismatch, got %v", err)
